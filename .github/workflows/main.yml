@@ -3,18 +3,27 @@ name: Build CodeUdaan Mobile APK
 
 on:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
   pull_request:
-    branches: [main, master]
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
@@ -53,19 +62,84 @@ jobs:
 
           echo "Using sdkmanager: $SDKMANAGER"
 
-          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses
+          LICENSE_STATUS=$?
+          set -o pipefail
+
+          if [ "$LICENSE_STATUS" -ne 0 ]; then
+            echo "Checking SDK licenses again..."
+            "$SDKMANAGER" --licenses
+          fi
 
           "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0"
 
-      - name: Build Debug APK
-        run: gradle --no-daemon --stacktrace assembleDebug
+      - name: Verify Project Files
+        shell: bash
+        run: |
+          set -e
 
-      - name: Upload APK
+          if [ ! -f "gradlew" ] && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
+            echo "ERROR: Gradle project files were not found in the repository root."
+            exit 1
+          fi
+
+          if [ ! -d "app" ]; then
+            echo "ERROR: app directory was not found."
+            exit 1
+          fi
+
+          echo "Project files found."
+          ls -la
+
+      - name: Make Gradle Wrapper Executable
+        if: ${{ hashFiles('gradlew') != '' }}
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        env:
+          GRADLE_OPTS: "-Xmx2048m -XX:MaxMetaspaceSize=512m"
+        run: |
+          if [ -f "./gradlew" ]; then
+            ./gradlew \
+              --no-daemon \
+              --max-workers=2 \
+              --stacktrace \
+              assembleDebug
+          else
+            gradle \
+              --no-daemon \
+              --max-workers=2 \
+              --stacktrace \
+              assembleDebug
+          fi
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -e
+
+          APK_PATH="app/build/outputs/apk/debug"
+
+          if [ ! -d "$APK_PATH" ]; then
+            echo "ERROR: Debug APK output directory not found."
+            exit 1
+          fi
+
+          find "$APK_PATH" -maxdepth 1 -type f -name "*.apk" -print
+
+          if ! find "$APK_PATH" -maxdepth 1 -type f -name "*.apk" | grep -q .; then
+            echo "ERROR: No APK was generated."
+            exit 1
+          fi
+
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: CodeUdaan-Mobile-Debug-APK
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          retention-days: 7
